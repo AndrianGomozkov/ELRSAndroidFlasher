@@ -31,6 +31,7 @@ import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.util.Locale;
+import java.util.ArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
@@ -64,6 +65,8 @@ public class MainActivity extends Activity {
     private ConnectivityManager.NetworkCallback networkCallback;
     private Network activeNetwork;
 
+    private volatile CountDownLatch permissionLatch;
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -75,7 +78,7 @@ public class MainActivity extends Activity {
         log("Готово.");
         log("Прошивка встроена в APK: " + ASSET_FIRMWARE);
         log("Wi-Fi: " + SSID_RX_HF + " / " + SSID_RX + ", пароль " + WIFI_PASSWORD);
-        log("Android может показать системное окно подключения — его надо подтвердить.");
+        log("Android может показать системное окно разрешений и окно подключения — оба надо подтвердить.");
     }
 
     private void buildUi() {
@@ -162,17 +165,107 @@ public class MainActivity extends Activity {
     }
 
     private void requestRuntimePermissions() {
-        if (Build.VERSION.SDK_INT >= 23) {
-            java.util.ArrayList<String> perms = new java.util.ArrayList<>();
-            if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
-                perms.add(Manifest.permission.ACCESS_FINE_LOCATION);
+        // Стартовый запрос. Основная проверка всё равно делается прямо перед Wi-Fi подключением.
+        requestWifiPermissionsAsync(false);
+    }
+
+    private boolean hasWifiConnectPermission() {
+        if (Build.VERSION.SDK_INT < 23) {
+            return true;
+        }
+
+        boolean fine = checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED;
+        boolean coarse = checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED;
+
+        if (Build.VERSION.SDK_INT >= 33) {
+            boolean nearby = checkSelfPermission(Manifest.permission.NEARBY_WIFI_DEVICES) == PackageManager.PERMISSION_GRANTED;
+            // Ошибка Android пишет "either of permissions", поэтому принимаем nearby ИЛИ location.
+            return nearby || fine || coarse;
+        }
+
+        return fine || coarse;
+    }
+
+    private ArrayList<String> missingWifiPermissions() {
+        ArrayList<String> perms = new ArrayList<>();
+
+        if (Build.VERSION.SDK_INT < 23) {
+            return perms;
+        }
+
+        if (Build.VERSION.SDK_INT >= 33 &&
+                checkSelfPermission(Manifest.permission.NEARBY_WIFI_DEVICES) != PackageManager.PERMISSION_GRANTED) {
+            perms.add(Manifest.permission.NEARBY_WIFI_DEVICES);
+        }
+
+        if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+            perms.add(Manifest.permission.ACCESS_FINE_LOCATION);
+        }
+
+        if (checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+            perms.add(Manifest.permission.ACCESS_COARSE_LOCATION);
+        }
+
+        return perms;
+    }
+
+    private void requestWifiPermissionsAsync(boolean verbose) {
+        if (Build.VERSION.SDK_INT < 23) {
+            return;
+        }
+
+        ArrayList<String> perms = missingWifiPermissions();
+        if (perms.isEmpty()) {
+            if (verbose) log("Wi-Fi permissions уже выданы.");
+            return;
+        }
+
+        if (verbose) {
+            log("Android требует разрешение для Wi-Fi подключения.");
+            log("Выдай Nearby devices / Устройства поблизости и Location / Геолокация.");
+        }
+
+        requestPermissions(perms.toArray(new String[0]), 100);
+    }
+
+    private boolean ensureWifiPermissionsBlocking(int timeoutSec) {
+        if (hasWifiConnectPermission()) {
+            return true;
+        }
+
+        permissionLatch = new CountDownLatch(1);
+        ui.post(() -> requestWifiPermissionsAsync(true));
+
+        try {
+            permissionLatch.await(timeoutSec, TimeUnit.SECONDS);
+        } catch (Exception ignored) {}
+
+        boolean ok = hasWifiConnectPermission();
+        if (!ok) {
+            log("Разрешения для Wi-Fi не выданы.");
+            log("Открой Android: Настройки → Приложения → ELRS Flasher → Разрешения.");
+            log("Включи Nearby devices / Устройства поблизости и Location / Геолокация.");
+            log("Также включи саму Геолокацию в шторке Android, если планшет Android 10-12.");
+        }
+
+        return ok;
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+
+        if (requestCode == 100) {
+            boolean ok = hasWifiConnectPermission();
+            if (ok) {
+                log("Разрешения для Wi-Fi выданы.");
+            } else {
+                log("Разрешения для Wi-Fi НЕ выданы или выданы не полностью.");
             }
-            if (Build.VERSION.SDK_INT >= 33 &&
-                    checkSelfPermission(Manifest.permission.NEARBY_WIFI_DEVICES) != PackageManager.PERMISSION_GRANTED) {
-                perms.add(Manifest.permission.NEARBY_WIFI_DEVICES);
-            }
-            if (!perms.isEmpty()) {
-                requestPermissions(perms.toArray(new String[0]), 100);
+
+            CountDownLatch latch = permissionLatch;
+            if (latch != null) {
+                latch.countDown();
             }
         }
     }
@@ -287,6 +380,11 @@ public class MainActivity extends Activity {
     }
 
     private boolean connectWifiBlocking(String ssid, int timeoutSec) {
+        if (!ensureWifiPermissionsBlocking(30)) {
+            log("Ошибка подключения к " + ssid + ": нет разрешений Android.");
+            return false;
+        }
+
         if (Build.VERSION.SDK_INT < 29) {
             log("WifiNetworkSpecifier требует Android 10+.");
             return false;
@@ -349,7 +447,11 @@ public class MainActivity extends Activity {
             return ok[0];
 
         } catch (Exception e) {
-            log("Ошибка подключения к " + ssid + ": " + e.getMessage());
+            String msg = String.valueOf(e.getMessage());
+            log("Ошибка подключения к " + ssid + ": " + msg);
+            if (msg.toLowerCase(Locale.ROOT).contains("permission") || msg.toLowerCase(Locale.ROOT).contains("granted")) {
+                log("Это ошибка Android-разрешений. Проверь Nearby devices / Location в настройках приложения.");
+            }
             return false;
         }
     }
