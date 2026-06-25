@@ -3,6 +3,7 @@ package com.example.elrsflasher;
 import android.Manifest;
 import android.app.Activity;
 import android.content.Context;
+import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.net.ConnectivityManager;
 import android.net.Network;
@@ -75,7 +76,7 @@ public class MainActivity extends Activity {
         buildUi();
         requestRuntimePermissions();
 
-        log("Готово.");
+        log("Готово. v0.4 Wi-Fi fallback fix.");
         log("Прошивка встроена в APK: " + ASSET_FIRMWARE);
         log("Wi-Fi: " + SSID_RX_HF + " / " + SSID_RX + ", пароль " + WIFI_PASSWORD);
         log("Android может показать системное окно разрешений и окно подключения — оба надо подтвердить.");
@@ -103,7 +104,14 @@ public class MainActivity extends Activity {
 
         btnWifi = new Button(this);
         btnWifi.setText("Подключить Wi-Fi");
-        btnWifi.setOnClickListener(v -> runAsync(() -> connectToAnyElrsWifiBlocking(60)));
+        btnWifi.setOnClickListener(v -> runAsync(() -> {
+            setRunning(true);
+            try {
+                connectToAnyElrsWifiBlocking(60);
+            } finally {
+                setRunning(false);
+            }
+        }));
         row1.addView(btnWifi, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1));
 
         btnFlash = new Button(this);
@@ -372,11 +380,60 @@ public class MainActivity extends Activity {
         }
     }
 
+
+    private boolean isWebUiReachableNow() {
+        try {
+            HttpResult r = httpGet("/");
+            return r.code >= 200 && r.code < 500;
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    private void openWifiSettingsHint() {
+        try {
+            log("Открываю системные Wi-Fi настройки. Выбери ExpressLRS RX / RX HF вручную, если авто-подключение не сработало.");
+            Intent intent = new Intent(Settings.ACTION_WIFI_SETTINGS);
+            startActivity(intent);
+        } catch (Exception e) {
+            log("Не удалось открыть Wi-Fi настройки: " + e.getMessage());
+        }
+    }
+
     private boolean connectToAnyElrsWifiBlocking(int timeoutSec) {
         log("Запрашиваю подключение к Wi-Fi ExpressLRS...");
+
+        // V0.4: если пользователь уже вручную подключил Android к ExpressLRS,
+        // не дёргаем системный Wi-Fi dialog повторно.
+        if (isWebUiReachableNow()) {
+            log("WebUI уже доступен через текущую Wi-Fi сеть.");
+            return true;
+        }
+
         // До прошивки часто RX HF, после прошивки часто RX.
-        if (connectWifiBlocking(SSID_RX_HF, Math.max(20, timeoutSec / 2))) return true;
-        return connectWifiBlocking(SSID_RX, Math.max(20, timeoutSec / 2));
+        int partTimeout = Math.max(20, timeoutSec / 2);
+
+        if (connectWifiBlocking(SSID_RX_HF, partTimeout)) return true;
+        if (isWebUiReachableNow()) return true;
+
+        if (connectWifiBlocking(SSID_RX, partTimeout)) return true;
+        if (isWebUiReachableNow()) return true;
+
+        log("Автоподключение не сработало.");
+        log("Fallback: можно подключить Wi-Fi вручную в Android к ExpressLRS RX / RX HF.");
+        openWifiSettingsHint();
+
+        // Даём время пользователю выбрать сеть вручную, потом проверяем 10.0.0.1.
+        long end = System.currentTimeMillis() + Math.max(30, timeoutSec) * 1000L;
+        while (running && System.currentTimeMillis() < end) {
+            if (isWebUiReachableNow()) {
+                log("WebUI стал доступен после ручного подключения.");
+                return true;
+            }
+            sleep(1000);
+        }
+
+        return false;
     }
 
     private boolean connectWifiBlocking(String ssid, int timeoutSec) {
@@ -593,6 +650,12 @@ public class MainActivity extends Activity {
             try {
                 HttpResult rb = httpGet("/reboot");
                 log("GET /reboot: HTTP " + rb.code);
+                if (rb.code < 200 || rb.code >= 500) {
+                    try {
+                        HttpResult rb2 = httpPostRaw("/reboot", new byte[0], "text/plain", null);
+                        log("POST /reboot: HTTP " + rb2.code);
+                    } catch (Exception ignored) {}
+                }
             } catch (Exception e) {
                 log("Команда /reboot оборвалась, это может быть нормально.");
             }
