@@ -76,7 +76,7 @@ public class MainActivity extends Activity {
         buildUi();
         requestRuntimePermissions();
 
-        log("Готово. v0.4 Wi-Fi fallback fix.");
+        log("Готово. v0.5 Flash Anyway + RX after reboot fix.");
         log("Прошивка встроена в APK: " + ASSET_FIRMWARE);
         log("Wi-Fi: " + SSID_RX_HF + " / " + SSID_RX + ", пароль " + WIFI_PASSWORD);
         log("Android может показать системное окно разрешений и окно подключения — оба надо подтвердить.");
@@ -353,8 +353,8 @@ public class MainActivity extends Activity {
             log("Прошивка отправлена. Жду ребут...");
             waitWebUiDown(60);
 
-            log("После ребута снова подключаюсь к Wi-Fi.");
-            if (!connectToAnyElrsWifiBlocking(90)) {
+            log("После ребута снова подключаюсь к Wi-Fi. Приоритет: ExpressLRS RX.");
+            if (!connectAfterRebootWifiBlocking(90)) {
                 log("Не удалось повторно подключиться после ребута.");
                 return false;
             }
@@ -400,30 +400,67 @@ public class MainActivity extends Activity {
         }
     }
 
-    private boolean connectToAnyElrsWifiBlocking(int timeoutSec) {
-        log("Запрашиваю подключение к Wi-Fi ExpressLRS...");
+    private void releaseCurrentWifiRequest() {
+        try {
+            if (networkCallback != null) {
+                connectivityManager.unregisterNetworkCallback(networkCallback);
+                networkCallback = null;
+            }
+        } catch (Exception ignored) {}
 
-        // V0.4: если пользователь уже вручную подключил Android к ExpressLRS,
-        // не дёргаем системный Wi-Fi dialog повторно.
-        if (isWebUiReachableNow()) {
+        try {
+            connectivityManager.bindProcessToNetwork(null);
+        } catch (Exception ignored) {}
+
+        activeNetwork = null;
+    }
+
+    private boolean connectToAnyElrsWifiBlocking(int timeoutSec) {
+        // До прошивки чаще сеть ExpressLRS RX HF, но RX тоже оставляем fallback.
+        return connectPreferredElrsWifiBlocking(SSID_RX_HF, SSID_RX, timeoutSec, true);
+    }
+
+    private boolean connectAfterRebootWifiBlocking(int timeoutSec) {
+        // После прошивки нужна новая сеть ExpressLRS RX. Не принимаем старый RX HF только потому,
+        // что на нём ещё отвечает 10.0.0.1.
+        return connectPreferredElrsWifiBlocking(SSID_RX, SSID_RX_HF, timeoutSec, false);
+    }
+
+    private boolean connectPreferredElrsWifiBlocking(String primarySsid, String fallbackSsid, int timeoutSec, boolean acceptAlreadyConnected) {
+        log("Запрашиваю подключение к Wi-Fi ExpressLRS. Приоритет: " + primarySsid);
+
+        if (acceptAlreadyConnected && isWebUiReachableNow()) {
             log("WebUI уже доступен через текущую Wi-Fi сеть.");
             return true;
         }
 
-        // До прошивки часто RX HF, после прошивки часто RX.
+        if (!acceptAlreadyConnected) {
+            log("Сбрасываю старый Wi-Fi request, чтобы не остаться на старой сети.");
+            releaseCurrentWifiRequest();
+            sleep(700);
+        }
+
         int partTimeout = Math.max(20, timeoutSec / 2);
 
-        if (connectWifiBlocking(SSID_RX_HF, partTimeout)) return true;
-        if (isWebUiReachableNow()) return true;
+        if (connectWifiBlocking(primarySsid, partTimeout)) return true;
+        if (isWebUiReachableNow()) {
+            log("WebUI доступен после попытки " + primarySsid + ".");
+            return true;
+        }
 
-        if (connectWifiBlocking(SSID_RX, partTimeout)) return true;
-        if (isWebUiReachableNow()) return true;
+        if (fallbackSsid != null && fallbackSsid.length() > 0) {
+            log("Пробую fallback SSID: " + fallbackSsid);
+            if (connectWifiBlocking(fallbackSsid, partTimeout)) return true;
+            if (isWebUiReachableNow()) {
+                log("WebUI доступен после fallback " + fallbackSsid + ".");
+                return true;
+            }
+        }
 
         log("Автоподключение не сработало.");
-        log("Fallback: можно подключить Wi-Fi вручную в Android к ExpressLRS RX / RX HF.");
+        log("Fallback: можно подключить Wi-Fi вручную к " + primarySsid + ".");
         openWifiSettingsHint();
 
-        // Даём время пользователю выбрать сеть вручную, потом проверяем 10.0.0.1.
         long end = System.currentTimeMillis() + Math.max(30, timeoutSec) * 1000L;
         while (running && System.currentTimeMillis() < end) {
             if (isWebUiReachableNow()) {
@@ -571,31 +608,99 @@ public class MainActivity extends Activity {
             writeUtf8(out, "\r\n--" + boundary + "--\r\n");
             out.flush();
 
-            HttpResult r = httpPostRaw("/update", body.toByteArray(), "multipart/form-data; boundary=" + boundary,
-                    new String[][] {{"X-FileSize", String.valueOf(firmware.length)}});
+            HttpResult r;
+            try {
+                r = httpPostRaw("/update", body.toByteArray(), "multipart/form-data; boundary=" + boundary,
+                        new String[][] {{"X-FileSize", String.valueOf(firmware.length)}});
+            } catch (Exception uploadEx) {
+                String msg = String.valueOf(uploadEx.getMessage());
+                log("Ошибка upload: " + msg);
+                log("После upload соединение могло оборваться из-за старта прошивки. Проверяю, не ушёл ли WebUI в ребут...");
+                if (waitWebUiDown(12)) {
+                    log("WebUI пропал после upload error — считаю, что прошивка стартовала.");
+                    return true;
+                }
+                return false;
+            }
 
-            log("Ответ /update: HTTP " + r.code + " " + safeShort(r.body, 200));
+            log("Ответ /update: HTTP " + r.code + " " + safeShort(r.body, 350));
 
             String low = r.body == null ? "" : r.body.toLowerCase(Locale.ROOT);
+
             if (r.code == 200 && low.contains("\"status\"") && low.contains("ok")) {
                 log("Устройство приняло прошивку.");
                 return true;
             }
 
             if (r.code == 200 && low.contains("mismatch")) {
-                log("Target mismatch. Подтверждаю Flash Anyway...");
-                HttpResult c = httpGet("/forceupdate?action=confirm");
-                log("Ответ /forceupdate: HTTP " + c.code + " " + safeShort(c.body, 200));
-                return c.code == 200 && c.body != null && c.body.toLowerCase(Locale.ROOT).contains("ok");
+                log("Target mismatch. Автоматически подтверждаю Flash Anyway...");
+                if (confirmFlashAnyway()) {
+                    log("Flash Anyway подтверждён.");
+                    return true;
+                }
+
+                log("Flash Anyway не подтвердился обычными запросами.");
+                log("Проверяю, не стартовала ли прошивка после mismatch...");
+                if (waitWebUiDown(15)) {
+                    log("WebUI пропал — считаю, что прошивка всё же стартовала.");
+                    return true;
+                }
+
+                return false;
             }
 
-            // Некоторые WebUI могут оборвать ответ после старта прошивки.
-            return r.code == 200;
+            // Некоторые WebUI могут оборвать/перезагрузиться без JSON.
+            if (r.code == 200) {
+                log("HTTP 200 без явного OK/mismatch. Проверяю ребут...");
+                if (waitWebUiDown(15)) {
+                    log("WebUI пропал — считаю upload успешным.");
+                    return true;
+                }
+                return true;
+            }
+
+            return false;
 
         } catch (Exception e) {
             log("Ошибка upload: " + e.getMessage());
             return false;
         }
+    }
+
+    private boolean confirmFlashAnyway() {
+        String[] paths = new String[] {
+                "/forceupdate?action=confirm",
+                "/forceupdate?confirm=true",
+                "/forceupdate"
+        };
+
+        for (String path : paths) {
+            try {
+                HttpResult c = httpGet(path);
+                log("GET " + path + ": HTTP " + c.code + " " + safeShort(c.body, 160));
+                String low = c.body == null ? "" : c.body.toLowerCase(Locale.ROOT);
+                if (c.code == 200 && (low.contains("ok") || low.contains("success") || low.length() == 0)) {
+                    return true;
+                }
+            } catch (Exception e) {
+                log("GET " + path + " оборвался: " + e.getMessage());
+                if (waitWebUiDown(8)) return true;
+            }
+
+            try {
+                HttpResult p = httpPostRaw(path, new byte[0], "text/plain", null);
+                log("POST " + path + ": HTTP " + p.code + " " + safeShort(p.body, 160));
+                String low = p.body == null ? "" : p.body.toLowerCase(Locale.ROOT);
+                if (p.code == 200 && (low.contains("ok") || low.contains("success") || low.length() == 0)) {
+                    return true;
+                }
+            } catch (Exception e) {
+                log("POST " + path + " оборвался: " + e.getMessage());
+                if (waitWebUiDown(8)) return true;
+            }
+        }
+
+        return false;
     }
 
     private boolean applySettings() {
