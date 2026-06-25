@@ -10,6 +10,7 @@
 
     <!-- Needed by Android Wi-Fi APIs. Android 10-12 usually needs location permission. -->
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
 
     <!-- Android 13+ nearby Wi-Fi permission. -->
     <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES"
