@@ -615,16 +615,6 @@ public class MainActivity extends Activity {
         return false;
     }
 
-    private String extractJsonStatus(String body) {
-        if (body == null || body.length() == 0) return "";
-        try {
-            JSONObject obj = new JSONObject(body);
-            return obj.optString("status", "").trim().toLowerCase(Locale.ROOT);
-        } catch (Exception ignored) {
-            return "";
-        }
-    }
-
     private boolean uploadFirmware() {
         // V0.8: upload нативный через HttpURLConnection.
         // WebView upload с base64 зависал на большой прошивке.
