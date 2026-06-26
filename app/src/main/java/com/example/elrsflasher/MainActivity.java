@@ -86,7 +86,7 @@ public class MainActivity extends Activity {
         buildUi();
         requestRuntimePermissions();
 
-        log("Готово. v0.7 WebView confirmations like PC version.");
+        log("Готово. v0.8 native upload + visible WebView settings.");
         log("Прошивка встроена в APK: " + ASSET_FIRMWARE);
         log("Wi-Fi: " + SSID_RX_HF + " / " + SSID_RX + ", пароль " + WIFI_PASSWORD);
         log("Android может показать системное окно разрешений и окно подключения — оба надо подтвердить.");
@@ -180,16 +180,23 @@ public class MainActivity extends Activity {
         root.addView(scroll, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, 0, 1));
 
+        TextView webHint = new TextView(this);
+        webHint.setText("Встроенный WebView для подтверждений WebUI:");
+        webHint.setTextSize(12);
+        root.addView(webHint);
+
         webView = new WebView(this);
-        webView.setVisibility(View.GONE);
+        webView.setVisibility(View.VISIBLE);
         WebSettings ws = webView.getSettings();
         ws.setJavaScriptEnabled(true);
         ws.setDomStorageEnabled(true);
         ws.setAllowFileAccess(false);
         ws.setAllowContentAccess(false);
+        ws.setMediaPlaybackRequiresUserGesture(false);
         webView.setWebChromeClient(new WebChromeClient());
         webView.addJavascriptInterface(new JsBridge(), "AndroidBridge");
-        root.addView(webView, new LinearLayout.LayoutParams(1, 1));
+        root.addView(webView, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(300)));
 
         setContentView(root);
     }
@@ -619,83 +626,170 @@ public class MainActivity extends Activity {
     }
 
     private boolean uploadFirmware() {
-        // V0.7: прошивка через встроенный WebView + JS fetch.
-        // Так WebUI-логика/confirm ведёт себя ближе к ПК-версии с браузером.
+        // V0.8: upload нативный через HttpURLConnection.
+        // WebView upload с base64 зависал на большой прошивке.
         try {
-            if (!webViewLoadBlocking("/", 45)) {
-                log("WebView не открыл WebUI перед прошивкой.");
+            byte[] firmware = readAsset(ASSET_FIRMWARE);
+            String boundary = "----ELRSAndroidBoundary" + System.currentTimeMillis();
+            String filename = ASSET_FIRMWARE;
+
+            log("Загружаю прошивку нативно: " + filename + ", размер " + firmware.length + " байт");
+
+            ByteArrayOutputStream body = new ByteArrayOutputStream();
+            DataOutputStream out = new DataOutputStream(body);
+
+            writeUtf8(out, "--" + boundary + "\r\n");
+            writeUtf8(out, "Content-Disposition: form-data; name=\"file_name\"\r\n\r\n");
+            writeUtf8(out, filename + "\r\n");
+
+            writeUtf8(out, "--" + boundary + "\r\n");
+            writeUtf8(out, "Content-Disposition: form-data; name=\"upload\"; filename=\"" + filename + "\"\r\n");
+            writeUtf8(out, "Content-Type: application/octet-stream\r\n\r\n");
+            out.write(firmware);
+            writeUtf8(out, "\r\n--" + boundary + "--\r\n");
+            out.flush();
+
+            HttpResult r;
+            try {
+                r = httpPostRaw("/update", body.toByteArray(), "multipart/form-data; boundary=" + boundary,
+                        new String[][] {{"X-FileSize", String.valueOf(firmware.length)}});
+            } catch (Exception uploadEx) {
+                String msg = String.valueOf(uploadEx.getMessage());
+                log("Ошибка upload: " + msg);
+                log("После upload соединение могло оборваться из-за старта прошивки. Проверяю, не ушёл ли WebUI в ребут...");
+                if (waitWebUiDown(12)) {
+                    log("WebUI пропал после upload error — считаю, что прошивка стартовала.");
+                    return true;
+                }
                 return false;
             }
 
-            byte[] firmware = readAsset(ASSET_FIRMWARE);
-            String b64 = Base64.encodeToString(firmware, Base64.NO_WRAP);
-            String filename = ASSET_FIRMWARE;
+            log("Ответ /update: HTTP " + r.code + " " + safeShort(r.body, 500));
 
-            log("Загружаю прошивку через WebView: " + filename + ", размер " + firmware.length + " байт");
+            String low = r.body == null ? "" : r.body.toLowerCase(Locale.ROOT);
+            String status = extractJsonStatus(r.body);
 
-            String js =
-                    "(async function(){\\n" +
-                    "  function sleep(ms){return new Promise(r=>setTimeout(r,ms));}\\n" +
-                    "  try {\\n" +
-                    "    const b64 = '" + b64 + "';\\n" +
-                    "    const bin = atob(b64);\\n" +
-                    "    const arr = new Uint8Array(bin.length);\\n" +
-                    "    for (let i=0;i<bin.length;i++) arr[i] = bin.charCodeAt(i);\\n" +
-                    "    const blob = new Blob([arr], {type:'application/octet-stream'});\\n" +
-                    "    const fd = new FormData();\\n" +
-                    "    fd.append('file_name', '" + jsEscape(filename) + "');\\n" +
-                    "    fd.append('upload', blob, '" + jsEscape(filename) + "');\\n" +
-                    "    const resp = await fetch('/update', {method:'POST', headers:{'X-FileSize':'" + firmware.length + "'}, body:fd});\\n" +
-                    "    const text = await resp.text();\\n" +
-                    "    let status = '';\\n" +
-                    "    try { status = (JSON.parse(text).status || '').toLowerCase(); } catch(e) {}\\n" +
-                    "    AndroidBridge.onWebResult('UPDATE:' + resp.status + ':' + status + ':' + text.substring(0,700));\\n" +
-                    "    if (status === 'mismatch') {\\n" +
-                    "      await sleep(500);\\n" +
-                    "      const c = await fetch('/forceupdate?action=confirm', {method:'GET', headers:{'Accept':'application/json'}});\\n" +
-                    "      const ct = await c.text();\\n" +
-                    "      let cs = '';\\n" +
-                    "      try { cs = (JSON.parse(ct).status || '').toLowerCase(); } catch(e) {}\\n" +
-                    "      AndroidBridge.onWebResult('CONFIRM:' + c.status + ':' + cs + ':' + ct.substring(0,500));\\n" +
-                    "    }\\n" +
-                    "  } catch(e) { AndroidBridge.onWebResult('ERROR:' + e.message); }\\n" +
-                    "})();";
-
-            String result = webViewEvalBlocking(js, 180);
-            log("WebView upload result: " + safeShort(result, 900));
-
-            if (result.startsWith("ERROR:")) {
-                log("Ошибка WebView upload. Проверяю, не ушёл ли WebUI в ребут...");
-                return waitWebUiDown(12);
+            if (r.code == 200 && "ok".equals(status)) {
+                log("Устройство приняло прошивку: status=ok.");
+                return true;
             }
 
-            if (result.startsWith("CONFIRM:")) {
-                String low = result.toLowerCase(Locale.ROOT);
-                if (low.contains(":ok:") || low.contains("status") || low.contains("ok")) {
+            if (r.code == 200 && ("mismatch".equals(status) || low.contains("\"status\":\"mismatch\"") || low.contains("\"status\": \"mismatch\""))) {
+                log("Target mismatch. Автоматически подтверждаю Flash Anyway...");
+                if (confirmFlashAnywayNative()) {
+                    log("Flash Anyway подтверждён.");
+                    return true;
+                }
+
+                log("Native confirm не сработал. Пробую подтверждение через WebView...");
+                if (confirmFlashAnywayWebView()) {
                     log("Flash Anyway подтверждён через WebView.");
                     return true;
                 }
-            }
 
-            if (result.startsWith("UPDATE:")) {
-                String low = result.toLowerCase(Locale.ROOT);
-                if (low.contains(":ok:")) {
-                    log("Устройство приняло прошивку через WebView.");
+                log("Flash Anyway не подтвердился. Проверяю, не стартовала ли прошивка...");
+                if (waitWebUiDown(15)) {
+                    log("WebUI пропал — считаю, что прошивка всё же стартовала.");
                     return true;
                 }
-                if (low.contains(":mismatch:")) {
-                    log("Mismatch получен, но confirm не вернулся. Проверяю ребут.");
-                    return waitWebUiDown(15);
-                }
 
-                log("Ответ WebView upload без явного OK/mismatch. Проверяю ребут.");
-                return waitWebUiDown(15) || result.contains("200");
+                return false;
+            }
+
+            if (r.code == 200 && "error".equals(status)) {
+                log("Устройство вернуло ошибку update.");
+                return false;
+            }
+
+            if (r.code == 200) {
+                log("HTTP 200 без явного OK/mismatch. Проверяю ребут...");
+                if (waitWebUiDown(15)) {
+                    log("WebUI пропал — считаю upload успешным.");
+                    return true;
+                }
+                return true;
             }
 
             return false;
 
         } catch (Exception e) {
-            log("Ошибка upload через WebView: " + e.getMessage());
+            log("Ошибка upload: " + e.getMessage());
+            return false;
+        }
+    }
+
+    private String extractJsonStatus(String body) {
+        if (body == null || body.length() == 0) return "";
+        try {
+            JSONObject obj = new JSONObject(body);
+            return obj.optString("status", "").trim().toLowerCase(Locale.ROOT);
+        } catch (Exception ignored) {
+            return "";
+        }
+    }
+
+    private boolean confirmFlashAnywayNative() {
+        String[] paths = new String[] {
+                "/forceupdate?action=confirm",
+                "/forceupdate?confirm=true",
+                "/forceupdate"
+        };
+
+        for (String path : paths) {
+            try {
+                HttpResult c = httpGet(path);
+                log("GET " + path + ": HTTP " + c.code + " " + safeShort(c.body, 200));
+                String status = extractJsonStatus(c.body);
+                String low = c.body == null ? "" : c.body.toLowerCase(Locale.ROOT);
+                if (c.code == 200 && ("ok".equals(status) || low.contains("\"status\":\"ok\"") || low.length() == 0)) {
+                    sleep(1000);
+                    return true;
+                }
+            } catch (Exception e) {
+                log("GET " + path + " оборвался: " + e.getMessage());
+                if (waitWebUiDown(8)) return true;
+            }
+
+            try {
+                HttpResult p = httpPostRaw(path, new byte[0], "text/plain", null);
+                log("POST " + path + ": HTTP " + p.code + " " + safeShort(p.body, 200));
+                String status = extractJsonStatus(p.body);
+                String low = p.body == null ? "" : p.body.toLowerCase(Locale.ROOT);
+                if (p.code == 200 && ("ok".equals(status) || low.contains("\"status\":\"ok\"") || low.length() == 0)) {
+                    sleep(1000);
+                    return true;
+                }
+            } catch (Exception e) {
+                log("POST " + path + " оборвался: " + e.getMessage());
+                if (waitWebUiDown(8)) return true;
+            }
+        }
+
+        return false;
+    }
+
+    private boolean confirmFlashAnywayWebView() {
+        try {
+            if (!webViewLoadBlocking("/", 30)) {
+                log("WebView не загрузил WebUI для Flash Anyway.");
+                return false;
+            }
+
+            String js =
+                    "(async function(){\\n" +
+                    "  try {\\n" +
+                    "    const r = await fetch('/forceupdate?action=confirm', {method:'GET', headers:{'Accept':'application/json'}});\\n" +
+                    "    const t = await r.text();\\n" +
+                    "    AndroidBridge.onWebResult('CONFIRM_WEBVIEW:' + r.status + ':' + t.substring(0,400));\\n" +
+                    "  } catch(e) { AndroidBridge.onWebResult('CONFIRM_ERROR:' + e.message); }\\n" +
+                    "})();";
+
+            String result = webViewEvalBlocking(js, 30);
+            log("WebView Flash Anyway result: " + safeShort(result, 500));
+            String low = result.toLowerCase(Locale.ROOT);
+            return low.contains("confirm_webview:200") && (low.contains("\"status\":\"ok\"") || low.contains("ok"));
+        } catch (Exception e) {
+            log("Ошибка WebView Flash Anyway: " + e.getMessage());
             return false;
         }
     }
@@ -744,55 +838,56 @@ public class MainActivity extends Activity {
     }
 
     private boolean applySettings() {
-        // V0.7: настройки через WebView, как ПК-версия:
-        // Model -> Save -> OK, Options -> Save -> REBOOT.
+        // V0.8: сначала WebView-клики как на ПК. Если WebView завис/не сработал — HTTP fallback.
         try {
-            log("=== Применяю Model + Options через WebView, с подтверждениями ===");
+            log("=== Применяю Model + Options через видимый WebView, с подтверждениями ===");
 
-            if (!webViewLoadBlocking("/", 45)) {
-                log("WebView не открыл WebUI для настроек.");
-                return false;
+            if (!webViewLoadBlocking("/", 60)) {
+                log("WebView не открыл WebUI для настроек. Пробую HTTP fallback.");
+                return applySettingsDirectHttpFallback();
             }
 
             String js =
                     "(async function(){\\n" +
                     "  function sleep(ms){return new Promise(r=>setTimeout(r,ms));}\\n" +
                     "  function ev(el,t){ if(el) el.dispatchEvent(new Event(t,{bubbles:true})); }\\n" +
+                    "  async function waitSel(sel, ms){\\n" +
+                    "    const end = Date.now()+ms;\\n" +
+                    "    while(Date.now()<end){ const el=document.querySelector(sel); if(el) return el; await sleep(200); }\\n" +
+                    "    return null;\\n" +
+                    "  }\\n" +
                     "  function clickExactButton(txt){\\n" +
                     "    const btns = Array.from(document.querySelectorAll('button,input[type=button],input[type=submit],.swal2-confirm'));\\n" +
                     "    const b = btns.find(x => { const s=((x.innerText||x.textContent||x.value||'')+'').trim().toLowerCase(); return s===txt.toLowerCase(); });\\n" +
                     "    if(b){ b.click(); return true; } return false;\\n" +
                     "  }\\n" +
                     "  try {\\n" +
-                    "    // MODEL\\n" +
                     "    let modelTab = document.querySelector(\\\"a[data-mui-controls='pane-justified-3']\\\");\\n" +
                     "    if (modelTab) modelTab.click();\\n" +
-                    "    await sleep(800);\\n" +
-                    "    let phrase = document.querySelector('#phrase');\\n" +
+                    "    let phrase = await waitSel('#phrase', 10000);\\n" +
                     "    if (!phrase) throw new Error('Model phrase field not found');\\n" +
                     "    phrase.value = 'Test'; ev(phrase,'input'); ev(phrase,'change'); phrase.dispatchEvent(new KeyboardEvent('keyup',{bubbles:true}));\\n" +
-                    "    await sleep(400);\\n" +
+                    "    await sleep(600);\\n" +
                     "    let cb = document.querySelector('#force-tlm');\\n" +
                     "    if (cb) { cb.checked = true; ev(cb,'input'); ev(cb,'change'); }\\n" +
                     "    let modelSave = document.querySelector('#config button[type=submit], form#config button[type=submit]');\\n" +
                     "    if (!modelSave) throw new Error('Model Save button not found');\\n" +
                     "    modelSave.disabled = false; modelSave.click();\\n" +
-                    "    await sleep(1800);\\n" +
+                    "    await sleep(2500);\\n" +
                     "    clickExactButton('OK');\\n" +
-                    "    await sleep(800);\\n" +
-                    "    // OPTIONS\\n" +
+                    "    await sleep(1000);\\n" +
                     "    let optTab = document.querySelector(\\\"a[data-mui-controls='pane-justified-1']\\\");\\n" +
                     "    if (optTab) optTab.click();\\n" +
-                    "    await sleep(900);\\n" +
-                    "    let rate = document.querySelector('#rateidx');\\n" +
+                    "    let rate = await waitSel('#rateidx', 10000);\\n" +
                     "    if (!rate) throw new Error('Options rateidx not found');\\n" +
                     "    rate.value = '23'; ev(rate,'input'); ev(rate,'change');\\n" +
                     "    let wifi = document.querySelector('#wifi-on-interval');\\n" +
                     "    if (wifi) { wifi.value = '2'; ev(wifi,'input'); ev(wifi,'change'); wifi.dispatchEvent(new KeyboardEvent('keyup',{bubbles:true})); }\\n" +
+                    "    await sleep(500);\\n" +
                     "    let optSave = document.querySelector('#submit-options');\\n" +
                     "    if (!optSave) throw new Error('Options Save button not found');\\n" +
                     "    optSave.disabled = false; optSave.click();\\n" +
-                    "    await sleep(1800);\\n" +
+                    "    await sleep(2500);\\n" +
                     "    let rebootClicked = clickExactButton('REBOOT') || clickExactButton('Reboot');\\n" +
                     "    if (!rebootClicked) {\\n" +
                     "      const btns = Array.from(document.querySelectorAll('button,input[type=button],input[type=submit]'));\\n" +
@@ -803,18 +898,82 @@ public class MainActivity extends Activity {
                     "  } catch(e) { AndroidBridge.onWebResult('SETTINGS_ERROR:' + e.message); }\\n" +
                     "})();";
 
-            String result = webViewEvalBlocking(js, 60);
-            log("WebView settings result: " + safeShort(result, 500));
+            String result = webViewEvalBlocking(js, 120);
+            log("WebView settings result: " + safeShort(result, 700));
 
             if (result.startsWith("SETTINGS_OK")) {
                 log("Post-flash настройки отправлены через WebView.");
                 return true;
             }
 
-            return false;
+            log("WebView настройки не подтвердились. Пробую HTTP fallback.");
+            return applySettingsDirectHttpFallback();
 
         } catch (Exception e) {
             log("Ошибка настроек через WebView: " + e.getMessage());
+            log("Пробую HTTP fallback.");
+            return applySettingsDirectHttpFallback();
+        }
+    }
+
+    private boolean applySettingsDirectHttpFallback() {
+        try {
+            log("=== HTTP fallback Model + Options ===");
+
+            HttpResult cfgRes = httpGet("/config");
+            if (cfgRes.code < 200 || cfgRes.code >= 300) {
+                log("GET /config не удался: HTTP " + cfgRes.code);
+                return false;
+            }
+
+            JSONObject root = new JSONObject(cfgRes.body);
+            JSONObject cfg = root.optJSONObject("config");
+            if (cfg == null) cfg = root;
+
+            JSONArray uid = new JSONArray();
+            for (int b : BINDING_UID_TEST) uid.put(b);
+            cfg.put("uid", uid);
+            cfg.put("vbind", cfg.optInt("vbind", 0));
+            cfg.put("force-tlm", 1);
+            if (!cfg.has("serial-protocol")) cfg.put("serial-protocol", 0);
+            if (!cfg.has("serial1-protocol")) cfg.put("serial1-protocol", 0);
+            if (!cfg.has("sbus-failsafe")) cfg.put("sbus-failsafe", 0);
+            if (!cfg.has("modelid")) cfg.put("modelid", 255);
+            if (!cfg.has("pwm")) cfg.put("pwm", new JSONArray());
+
+            HttpResult cfgPost = httpPostJson("/config", cfg.toString());
+            log("POST /config fallback: HTTP " + cfgPost.code);
+            if (cfgPost.code < 200 || cfgPost.code >= 300) return false;
+
+            sleep(600);
+
+            HttpResult optRes = httpGet("/options.json");
+            if (optRes.code < 200 || optRes.code >= 300) {
+                log("GET /options.json не удался: HTTP " + optRes.code);
+                return false;
+            }
+
+            JSONObject options = new JSONObject(optRes.body);
+            options.put("rateidx", PACKET_RATE_IDX);
+            options.put("wifi-on-interval", WIFI_AUTO_INTERVAL_SEC);
+            options.put("customised", true);
+
+            HttpResult optPost = httpPostJson("/options.json", options.toString());
+            log("POST /options.json fallback: HTTP " + optPost.code);
+            if (optPost.code < 200 || optPost.code >= 300) return false;
+
+            try {
+                HttpResult rb = httpGet("/reboot");
+                log("GET /reboot fallback: HTTP " + rb.code);
+            } catch (Exception e) {
+                log("Команда /reboot fallback оборвалась, это может быть нормально.");
+            }
+
+            log("HTTP fallback настройки отправлены.");
+            return true;
+
+        } catch (Exception e) {
+            log("Ошибка HTTP fallback настроек: " + e.getMessage());
             return false;
         }
     }
