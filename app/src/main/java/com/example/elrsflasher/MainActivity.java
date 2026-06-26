@@ -55,6 +55,8 @@ public class MainActivity extends Activity {
     private static final int PACKET_RATE_IDX = 23;       // S-Band RUS 24Hz(-126dBm)
     private static final int WIFI_AUTO_INTERVAL_SEC = 2; // просили auto interval = 2
     private static final int CYCLE_DELAY_SEC = 60;
+    private static final int WIFI_CONNECT_SHORT_SEC = 12;
+    private static final int WIFI_CONNECT_AFTER_REBOOT_SEC = 25;
 
     private final Handler ui = new Handler(Looper.getMainLooper());
     private TextView logView;
@@ -86,7 +88,7 @@ public class MainActivity extends Activity {
         buildUi();
         requestRuntimePermissions();
 
-        log("Готово. v0.8 native upload + visible WebView settings.");
+        log("Готово. v0.11 forceupdate reboot fix.");
         log("Прошивка встроена в APK: " + ASSET_FIRMWARE);
         log("Wi-Fi: " + SSID_RX_HF + " / " + SSID_RX + ", пароль " + WIFI_PASSWORD);
         log("Android может показать системное окно разрешений и окно подключения — оба надо подтвердить.");
@@ -117,7 +119,7 @@ public class MainActivity extends Activity {
         btnWifi.setOnClickListener(v -> runAsync(() -> {
             setRunning(true);
             try {
-                connectToAnyElrsWifiBlocking(60);
+                connectToAnyElrsWifiBlocking(WIFI_CONNECT_SHORT_SEC);
             } finally {
                 setRunning(false);
             }
@@ -139,14 +141,17 @@ public class MainActivity extends Activity {
         btnSettings.setOnClickListener(v -> runAsync(() -> {
             setRunning(true);
             try {
-                log("Ручное применение настроек. Приоритет Wi-Fi: ExpressLRS RX.");
-                connectAfterRebootWifiBlocking(60);
-                if (!waitWebUiAvailable(90)) {
+                log("Ручное применение настроек. Только Wi-Fi: ExpressLRS RX.");
+                connectOnlyRxWifiBlocking(WIFI_CONNECT_AFTER_REBOOT_SEC);
+                if (!waitWebUiAvailable(35)) {
                     log("WebUI не отвечает, настройки не применены.");
                     return;
                 }
-                applySettings();
-                logBig("НАСТРОЙКИ ОТПРАВЛЕНЫ.");
+                if (applySettings()) {
+                    logBig("НАСТРОЙКИ ОТПРАВЛЕНЫ.");
+                } else {
+                    log("Настройки не применились.");
+                }
             } finally {
                 setRunning(false);
             }
@@ -171,22 +176,8 @@ public class MainActivity extends Activity {
 
         root.addView(row2);
 
-        logView = new TextView(this);
-        logView.setTextSize(13);
-        logView.setTextIsSelectable(true);
-
-        ScrollView scroll = new ScrollView(this);
-        scroll.addView(logView);
-        root.addView(scroll, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1));
-
-        TextView webHint = new TextView(this);
-        webHint.setText("Встроенный WebView для подтверждений WebUI:");
-        webHint.setTextSize(12);
-        root.addView(webHint);
-
         webView = new WebView(this);
-        webView.setVisibility(View.VISIBLE);
+        webView.setVisibility(View.GONE);
         WebSettings ws = webView.getSettings();
         ws.setJavaScriptEnabled(true);
         ws.setDomStorageEnabled(true);
@@ -195,8 +186,16 @@ public class MainActivity extends Activity {
         ws.setMediaPlaybackRequiresUserGesture(false);
         webView.setWebChromeClient(new WebChromeClient());
         webView.addJavascriptInterface(new JsBridge(), "AndroidBridge");
-        root.addView(webView, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, dp(300)));
+        root.addView(webView, new LinearLayout.LayoutParams(1, 1));
+
+        logView = new TextView(this);
+        logView.setTextSize(13);
+        logView.setTextIsSelectable(true);
+
+        ScrollView scroll = new ScrollView(this);
+        scroll.addView(logView);
+        root.addView(scroll, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1));
 
         setContentView(root);
     }
@@ -364,12 +363,12 @@ public class MainActivity extends Activity {
 
     private boolean runFullFlashCycle() {
         try {
-            if (!connectToAnyElrsWifiBlocking(60)) {
+            if (!connectToAnyElrsWifiBlocking(WIFI_CONNECT_SHORT_SEC)) {
                 log("Не удалось подключиться к ExpressLRS Wi-Fi.");
                 return false;
             }
 
-            if (!waitWebUiAvailable(90)) {
+            if (!waitWebUiAvailable(35)) {
                 log("WebUI не отвечает до прошивки.");
                 return false;
             }
@@ -383,12 +382,12 @@ public class MainActivity extends Activity {
             waitWebUiDown(60);
 
             log("После ребута снова подключаюсь к Wi-Fi. Приоритет: ExpressLRS RX.");
-            if (!connectAfterRebootWifiBlocking(90)) {
+            if (!connectAfterRebootWifiBlocking(WIFI_CONNECT_AFTER_REBOOT_SEC)) {
                 log("Не удалось повторно подключиться после ребута.");
                 return false;
             }
 
-            if (!waitWebUiAvailable(180)) {
+            if (!waitWebUiAvailable(45)) {
                 log("WebUI после ребута не отвечает.");
                 return false;
             }
@@ -396,8 +395,8 @@ public class MainActivity extends Activity {
             boolean okSettings = applySettings();
             if (!okSettings) {
                 log("Post настройки не применились. Делаю автоповтор один раз с приоритетом ExpressLRS RX...");
-                connectAfterRebootWifiBlocking(60);
-                waitWebUiAvailable(90);
+                connectAfterRebootWifiBlocking(WIFI_CONNECT_AFTER_REBOOT_SEC);
+                waitWebUiAvailable(35);
                 okSettings = applySettings();
             }
 
@@ -444,15 +443,32 @@ public class MainActivity extends Activity {
         activeNetwork = null;
     }
 
+    private boolean connectOnlyRxHfWifiBlocking(int timeoutSec) {
+        log("Запрашиваю подключение к Wi-Fi ExpressLRS. Только: " + SSID_RX_HF);
+        if (isWebUiReachableNow()) {
+            log("WebUI уже доступен через текущую Wi-Fi сеть.");
+            return true;
+        }
+        boolean ok = connectWifiBlocking(SSID_RX_HF, timeoutSec);
+        if (!ok && isWebUiReachableNow()) return true;
+        return ok;
+    }
+
+    private boolean connectOnlyRxWifiBlocking(int timeoutSec) {
+        log("Запрашиваю подключение к Wi-Fi ExpressLRS. Только: " + SSID_RX);
+        releaseCurrentWifiRequest();
+        sleep(500);
+        boolean ok = connectWifiBlocking(SSID_RX, timeoutSec);
+        if (!ok && isWebUiReachableNow()) return true;
+        return ok;
+    }
+
     private boolean connectToAnyElrsWifiBlocking(int timeoutSec) {
-        // До прошивки чаще сеть ExpressLRS RX HF, но RX тоже оставляем fallback.
-        return connectPreferredElrsWifiBlocking(SSID_RX_HF, SSID_RX, timeoutSec, true);
+        return connectOnlyRxHfWifiBlocking(Math.min(timeoutSec, WIFI_CONNECT_SHORT_SEC));
     }
 
     private boolean connectAfterRebootWifiBlocking(int timeoutSec) {
-        // После прошивки нужна новая сеть ExpressLRS RX. Не принимаем старый RX HF только потому,
-        // что на нём ещё отвечает 10.0.0.1.
-        return connectPreferredElrsWifiBlocking(SSID_RX, SSID_RX_HF, timeoutSec, false);
+        return connectOnlyRxWifiBlocking(Math.min(timeoutSec, WIFI_CONNECT_AFTER_REBOOT_SEC));
     }
 
     private boolean connectPreferredElrsWifiBlocking(String primarySsid, String fallbackSsid, int timeoutSec, boolean acceptAlreadyConnected) {
@@ -615,6 +631,16 @@ public class MainActivity extends Activity {
         return false;
     }
 
+    private String extractJsonStatus(String body) {
+        if (body == null || body.length() == 0) return "";
+        try {
+            JSONObject obj = new JSONObject(body);
+            return obj.optString("status", "").trim().toLowerCase(Locale.ROOT);
+        } catch (Exception ignored) {
+            return "";
+        }
+    }
+
     private boolean uploadFirmware() {
         // V0.8: upload нативный через HttpURLConnection.
         // WebView upload с base64 зависал на большой прошивке.
@@ -667,7 +693,7 @@ public class MainActivity extends Activity {
             if (r.code == 200 && ("mismatch".equals(status) || low.contains("\"status\":\"mismatch\"") || low.contains("\"status\": \"mismatch\""))) {
                 log("Target mismatch. Автоматически подтверждаю Flash Anyway...");
                 if (confirmFlashAnywayNative()) {
-                    log("Flash Anyway подтверждён.");
+                    log("Flash Anyway подтверждён, ребут проверен.");
                     return true;
                 }
 
@@ -718,6 +744,30 @@ public class MainActivity extends Activity {
         }
     }
 
+    private boolean waitOrForceRebootAfterFlashAnyway() {
+        log("Жду, что WebUI пропадёт после Flash Anyway...");
+        if (waitWebUiDown(20)) {
+            log("WebUI пропал после Flash Anyway — ребут/перезапуск пошёл.");
+            return true;
+        }
+
+        log("WebUI не пропал после Flash Anyway. Пробую принудительный /reboot...");
+        try {
+            HttpResult rb = httpGet("/reboot");
+            log("GET /reboot after Flash Anyway: HTTP " + rb.code + " " + safeShort(rb.body, 200));
+        } catch (Exception e) {
+            log("GET /reboot after Flash Anyway оборвался, это может быть нормально: " + e.getMessage());
+        }
+
+        if (waitWebUiDown(15)) {
+            log("WebUI пропал после принудительного /reboot.");
+            return true;
+        }
+
+        log("После Flash Anyway и /reboot WebUI не пропал. Считаю, что ребут не стартовал.");
+        return false;
+    }
+
     private boolean confirmFlashAnywayNative() {
         String[] paths = new String[] {
                 "/forceupdate?action=confirm",
@@ -732,8 +782,8 @@ public class MainActivity extends Activity {
                 String status = extractJsonStatus(c.body);
                 String low = c.body == null ? "" : c.body.toLowerCase(Locale.ROOT);
                 if (c.code == 200 && ("ok".equals(status) || low.contains("\"status\":\"ok\"") || low.length() == 0)) {
-                    sleep(1000);
-                    return true;
+                    sleep(800);
+                    return waitOrForceRebootAfterFlashAnyway();
                 }
             } catch (Exception e) {
                 log("GET " + path + " оборвался: " + e.getMessage());
@@ -746,8 +796,8 @@ public class MainActivity extends Activity {
                 String status = extractJsonStatus(p.body);
                 String low = p.body == null ? "" : p.body.toLowerCase(Locale.ROOT);
                 if (p.code == 200 && ("ok".equals(status) || low.contains("\"status\":\"ok\"") || low.length() == 0)) {
-                    sleep(1000);
-                    return true;
+                    sleep(800);
+                    return waitOrForceRebootAfterFlashAnyway();
                 }
             } catch (Exception e) {
                 log("POST " + path + " оборвался: " + e.getMessage());
@@ -777,7 +827,11 @@ public class MainActivity extends Activity {
             String result = webViewEvalBlocking(js, 30);
             log("WebView Flash Anyway result: " + safeShort(result, 500));
             String low = result.toLowerCase(Locale.ROOT);
-            return low.contains("confirm_webview:200") && (low.contains("\"status\":\"ok\"") || low.contains("ok"));
+            boolean ok = low.contains("confirm_webview:200") && (low.contains("\"status\":\"ok\"") || low.contains("ok"));
+            if (ok) {
+                return waitOrForceRebootAfterFlashAnyway();
+            }
+            return false;
         } catch (Exception e) {
             log("Ошибка WebView Flash Anyway: " + e.getMessage());
             return false;
@@ -828,82 +882,154 @@ public class MainActivity extends Activity {
     }
 
     private boolean applySettings() {
-        // V0.8: сначала WebView-клики как на ПК. Если WebView завис/не сработал — HTTP fallback.
+        // V0.10: без WebView-ожиданий. Быстро применяем через HTTP API.
+        // Flash Anyway уже подтверждается отдельно. Для Options после POST обязательно /reboot.
         try {
-            log("=== Применяю Model + Options через видимый WebView, с подтверждениями ===");
+            log("=== Быстро применяю Model + Options через HTTP API ===");
 
-            if (!webViewLoadBlocking("/", 60)) {
-                log("WebView не открыл WebUI для настроек. Пробую HTTP fallback.");
-                return applySettingsDirectHttpFallback();
+            HttpResult cfgRes = httpGet("/config");
+            if (cfgRes.code < 200 || cfgRes.code >= 300) {
+                log("GET /config не удался: HTTP " + cfgRes.code);
+                return false;
             }
 
-            String js =
-                    "(async function(){\\n" +
-                    "  function sleep(ms){return new Promise(r=>setTimeout(r,ms));}\\n" +
-                    "  function ev(el,t){ if(el) el.dispatchEvent(new Event(t,{bubbles:true})); }\\n" +
-                    "  async function waitSel(sel, ms){\\n" +
-                    "    const end = Date.now()+ms;\\n" +
-                    "    while(Date.now()<end){ const el=document.querySelector(sel); if(el) return el; await sleep(200); }\\n" +
-                    "    return null;\\n" +
-                    "  }\\n" +
-                    "  function clickExactButton(txt){\\n" +
-                    "    const btns = Array.from(document.querySelectorAll('button,input[type=button],input[type=submit],.swal2-confirm'));\\n" +
-                    "    const b = btns.find(x => { const s=((x.innerText||x.textContent||x.value||'')+'').trim().toLowerCase(); return s===txt.toLowerCase(); });\\n" +
-                    "    if(b){ b.click(); return true; } return false;\\n" +
-                    "  }\\n" +
-                    "  try {\\n" +
-                    "    let modelTab = document.querySelector(\\\"a[data-mui-controls='pane-justified-3']\\\");\\n" +
-                    "    if (modelTab) modelTab.click();\\n" +
-                    "    let phrase = await waitSel('#phrase', 10000);\\n" +
-                    "    if (!phrase) throw new Error('Model phrase field not found');\\n" +
-                    "    phrase.value = 'Test'; ev(phrase,'input'); ev(phrase,'change'); phrase.dispatchEvent(new KeyboardEvent('keyup',{bubbles:true}));\\n" +
-                    "    await sleep(600);\\n" +
-                    "    let cb = document.querySelector('#force-tlm');\\n" +
-                    "    if (cb) { cb.checked = true; ev(cb,'input'); ev(cb,'change'); }\\n" +
-                    "    let modelSave = document.querySelector('#config button[type=submit], form#config button[type=submit]');\\n" +
-                    "    if (!modelSave) throw new Error('Model Save button not found');\\n" +
-                    "    modelSave.disabled = false; modelSave.click();\\n" +
-                    "    await sleep(2500);\\n" +
-                    "    clickExactButton('OK');\\n" +
-                    "    await sleep(1000);\\n" +
-                    "    let optTab = document.querySelector(\\\"a[data-mui-controls='pane-justified-1']\\\");\\n" +
-                    "    if (optTab) optTab.click();\\n" +
-                    "    let rate = await waitSel('#rateidx', 10000);\\n" +
-                    "    if (!rate) throw new Error('Options rateidx not found');\\n" +
-                    "    rate.value = '23'; ev(rate,'input'); ev(rate,'change');\\n" +
-                    "    let wifi = document.querySelector('#wifi-on-interval');\\n" +
-                    "    if (wifi) { wifi.value = '2'; ev(wifi,'input'); ev(wifi,'change'); wifi.dispatchEvent(new KeyboardEvent('keyup',{bubbles:true})); }\\n" +
-                    "    await sleep(500);\\n" +
-                    "    let optSave = document.querySelector('#submit-options');\\n" +
-                    "    if (!optSave) throw new Error('Options Save button not found');\\n" +
-                    "    optSave.disabled = false; optSave.click();\\n" +
-                    "    await sleep(2500);\\n" +
-                    "    let rebootClicked = clickExactButton('REBOOT') || clickExactButton('Reboot');\\n" +
-                    "    if (!rebootClicked) {\\n" +
-                    "      const btns = Array.from(document.querySelectorAll('button,input[type=button],input[type=submit]'));\\n" +
-                    "      const rb = btns.find(x => ((x.innerText||x.textContent||x.value||'')+'').toLowerCase().includes('reboot'));\\n" +
-                    "      if (rb) { rb.click(); rebootClicked = true; }\\n" +
-                    "    }\\n" +
-                    "    AndroidBridge.onWebResult('SETTINGS_OK:reboot=' + rebootClicked);\\n" +
-                    "  } catch(e) { AndroidBridge.onWebResult('SETTINGS_ERROR:' + e.message); }\\n" +
-                    "})();";
+            JSONObject root = new JSONObject(cfgRes.body);
+            JSONObject cfg = root.optJSONObject("config");
+            if (cfg == null) cfg = root;
 
-            String result = webViewEvalBlocking(js, 120);
-            log("WebView settings result: " + safeShort(result, 700));
+            JSONArray uid = new JSONArray();
+            for (int b : BINDING_UID_TEST) uid.put(b);
 
-            if (result.startsWith("SETTINGS_OK")) {
-                log("Post-flash настройки отправлены через WebView.");
-                return true;
+            cfg.put("uid", uid);
+            cfg.put("vbind", cfg.optInt("vbind", 0));
+            cfg.put("force-tlm", 1);
+            if (!cfg.has("serial-protocol")) cfg.put("serial-protocol", 0);
+            if (!cfg.has("serial1-protocol")) cfg.put("serial1-protocol", 0);
+            if (!cfg.has("sbus-failsafe")) cfg.put("sbus-failsafe", 0);
+            if (!cfg.has("modelid")) cfg.put("modelid", 255);
+            if (!cfg.has("pwm")) cfg.put("pwm", new JSONArray());
+
+            HttpResult cfgPost = httpPostJson("/config", cfg.toString());
+            log("POST /config: HTTP " + cfgPost.code);
+            if (cfgPost.code < 200 || cfgPost.code >= 300) return false;
+
+            sleep(400);
+
+            HttpResult optRes = httpGet("/options.json");
+            if (optRes.code < 200 || optRes.code >= 300) {
+                log("GET /options.json не удался: HTTP " + optRes.code);
+                return false;
             }
 
-            log("WebView настройки не подтвердились. Пробую HTTP fallback.");
-            return applySettingsDirectHttpFallback();
+            JSONObject options = new JSONObject(optRes.body);
+            options.put("rateidx", PACKET_RATE_IDX);
+            options.put("wifi-on-interval", WIFI_AUTO_INTERVAL_SEC);
+            options.put("customised", true);
+
+            HttpResult optPost = httpPostJson("/options.json", options.toString());
+            log("POST /options.json: HTTP " + optPost.code);
+            if (optPost.code < 200 || optPost.code >= 300) return false;
+
+            try {
+                HttpResult rb = httpGet("/reboot");
+                log("GET /reboot: HTTP " + rb.code);
+            } catch (Exception e) {
+                log("GET /reboot оборвался, это может быть нормально.");
+            }
+
+            log("HTTP настройки отправлены.");
+            return true;
 
         } catch (Exception e) {
-            log("Ошибка настроек через WebView: " + e.getMessage());
-            log("Пробую HTTP fallback.");
-            return applySettingsDirectHttpFallback();
+            log("Ошибка HTTP настроек: " + e.getMessage());
+            return false;
         }
+    }
+
+    private String webViewEvalReturnBlocking(String bodyScript, int timeoutSec) {
+        CountDownLatch latch = new CountDownLatch(1);
+        final String[] result = {""};
+
+        String script = "(function(){ try { " + bodyScript + " } catch(e) { return 'ERR:' + e.message; } })();";
+
+        ui.post(() -> {
+            try {
+                webView.evaluateJavascript(script, value -> {
+                    result[0] = decodeJsValue(value);
+                    latch.countDown();
+                });
+            } catch (Exception e) {
+                result[0] = "ERR:" + e.getMessage();
+                latch.countDown();
+            }
+        });
+
+        try {
+            latch.await(timeoutSec, TimeUnit.SECONDS);
+        } catch (Exception ignored) {}
+
+        if (result[0] == null || result[0].length() == 0) return "TIMEOUT";
+        return result[0];
+    }
+
+    private String decodeJsValue(String value) {
+        if (value == null) return "";
+        if ("null".equals(value)) return "";
+        try {
+            JSONArray arr = new JSONArray("[" + value + "]");
+            Object v = arr.get(0);
+            return v == null ? "" : String.valueOf(v);
+        } catch (Exception ignored) {
+            return value;
+        }
+    }
+
+    private boolean waitWebViewSelector(String selector, int timeoutSec) {
+        long end = System.currentTimeMillis() + timeoutSec * 1000L;
+        String safe = selector.replace("\\", "\\\\").replace("'", "\\'");
+        while (running && System.currentTimeMillis() < end) {
+            String r = webViewEvalReturnBlocking(
+                    "return document.querySelector('" + safe + "') ? 'YES' : 'NO';",
+                    3
+            );
+            if ("YES".equals(r)) return true;
+            sleep(300);
+        }
+        return false;
+    }
+
+    private boolean clickWebViewButtonLoop(String exactText, int timeoutSec) {
+        long end = System.currentTimeMillis() + timeoutSec * 1000L;
+        String safe = exactText.replace("\\", "\\\\").replace("'", "\\'");
+        while (running && System.currentTimeMillis() < end) {
+            String r = webViewEvalReturnBlocking(
+                    "var txt='" + safe + "'.toLowerCase();" +
+                    "var btns=Array.from(document.querySelectorAll('button,input[type=button],input[type=submit],.swal2-confirm'));" +
+                    "var b=btns.find(x=>(((x.innerText||x.textContent||x.value||'')+'').trim().toLowerCase()===txt));" +
+                    "if(b){b.click(); return 'CLICKED';} return 'NO_BUTTON';",
+                    3
+            );
+            if ("CLICKED".equals(r)) return true;
+            sleep(400);
+        }
+        return false;
+    }
+
+    private boolean clickWebViewButtonContainsLoop(String lowerText, int timeoutSec) {
+        long end = System.currentTimeMillis() + timeoutSec * 1000L;
+        String safe = lowerText.replace("\\", "\\\\").replace("'", "\\'");
+        while (running && System.currentTimeMillis() < end) {
+            String r = webViewEvalReturnBlocking(
+                    "var txt='" + safe + "';" +
+                    "var btns=Array.from(document.querySelectorAll('button,input[type=button],input[type=submit]'));" +
+                    "var b=btns.find(x=>(((x.innerText||x.textContent||x.value||'')+'').toLowerCase().includes(txt)));" +
+                    "if(b){b.click(); return 'CLICKED';} return 'NO_BUTTON';",
+                    3
+            );
+            if ("CLICKED".equals(r)) return true;
+            sleep(400);
+        }
+        return false;
     }
 
     private boolean applySettingsDirectHttpFallback() {
