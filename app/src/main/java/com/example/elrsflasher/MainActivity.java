@@ -2,6 +2,9 @@ package com.example.elrsflasher;
 
 import android.Manifest;
 import android.app.Activity;
+import android.text.InputType;
+import android.content.SharedPreferences;
+import android.app.AlertDialog;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
@@ -44,19 +47,27 @@ import java.util.concurrent.TimeUnit;
 
 public class MainActivity extends Activity {
     private static final String ELRS_URL = "http://10.0.0.1";
-    private static final String SSID_RX = "ExpressLRS RX";
-    private static final String SSID_RX_HF = "ExpressLRS RX HF";
-    private static final String WIFI_PASSWORD = "expresslrs";
+    private static final String DEFAULT_SSID_RX = "ExpressLRS RX";
+    private static final String DEFAULT_SSID_RX_HF = "ExpressLRS RX HF";
+    private static final String DEFAULT_WIFI_PASSWORD = "expresslrs";
     private static final String ASSET_FIRMWARE = "OR5b4_FlyFish_9624R_wifi_auto_2s.bin";
 
-    // UID, который твой WebUI показывает для Binding Phrase = Test.
-    private static final int[] BINDING_UID_TEST = {24, 99, 211, 80, 18, 169};
+    private static final String DEFAULT_BINDING_UID = "24,99,211,80,18,169";
+    private static final int DEFAULT_PACKET_RATE_IDX = 23;
+    private static final int DEFAULT_WIFI_AUTO_INTERVAL_SEC = 2;
+    private static final int DEFAULT_CYCLE_DELAY_SEC = 60;
+    private static final int DEFAULT_WIFI_CONNECT_SHORT_SEC = 12;
+    private static final int DEFAULT_WIFI_CONNECT_AFTER_REBOOT_SEC = 25;
 
-    private static final int PACKET_RATE_IDX = 23;       // S-Band RUS 24Hz(-126dBm)
-    private static final int WIFI_AUTO_INTERVAL_SEC = 2; // просили auto interval = 2
-    private static final int CYCLE_DELAY_SEC = 60;
-    private static final int WIFI_CONNECT_SHORT_SEC = 12;
-    private static final int WIFI_CONNECT_AFTER_REBOOT_SEC = 25;
+    private String ssidRx = DEFAULT_SSID_RX;
+    private String ssidRxHf = DEFAULT_SSID_RX_HF;
+    private String wifiPassword = DEFAULT_WIFI_PASSWORD;
+    private String bindingUidText = DEFAULT_BINDING_UID;
+    private int packetRateIdx = DEFAULT_PACKET_RATE_IDX;
+    private int wifiAutoIntervalSec = DEFAULT_WIFI_AUTO_INTERVAL_SEC;
+    private int cycleDelaySec = DEFAULT_CYCLE_DELAY_SEC;
+    private int wifiConnectShortSec = DEFAULT_WIFI_CONNECT_SHORT_SEC;
+    private int wifiConnectAfterRebootSec = DEFAULT_WIFI_CONNECT_AFTER_REBOOT_SEC;
 
     private final Handler ui = new Handler(Looper.getMainLooper());
     private TextView logView;
@@ -65,6 +76,7 @@ public class MainActivity extends Activity {
     private Button btnFlash;
     private Button btnSettings;
     private Button btnCycle;
+    private Button btnSettingsMenu;
     private Button btnStop;
     private WebView webView;
 
@@ -85,12 +97,14 @@ public class MainActivity extends Activity {
         super.onCreate(savedInstanceState);
 
         connectivityManager = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+        loadAppSettings();
         buildUi();
         requestRuntimePermissions();
 
-        log("Готово. v0.11 forceupdate reboot fix.");
+        log("Готово. v0.12 editable settings.");
         log("Прошивка встроена в APK: " + ASSET_FIRMWARE);
-        log("Wi-Fi: " + SSID_RX_HF + " / " + SSID_RX + ", пароль " + WIFI_PASSWORD);
+        log("Wi-Fi: " + ssidRxHf + " / " + ssidRx + ", пароль " + wifiPassword);
+        log("Текущие настройки: " + currentSettingsText());
         log("Android может показать системное окно разрешений и окно подключения — оба надо подтвердить.");
     }
 
@@ -106,7 +120,7 @@ public class MainActivity extends Activity {
         root.addView(statusView);
 
         TextView info = new TextView(this);
-        info.setText("Настройки: Binding UID Test = 24,99,211,80,18,169; rateidx=23; wifi-on-interval=2.");
+        info.setText(currentSettingsText());
         info.setTextSize(14);
         info.setPadding(0, dp(6), 0, dp(8));
         root.addView(info);
@@ -119,7 +133,7 @@ public class MainActivity extends Activity {
         btnWifi.setOnClickListener(v -> runAsync(() -> {
             setRunning(true);
             try {
-                connectToAnyElrsWifiBlocking(WIFI_CONNECT_SHORT_SEC);
+                connectToAnyElrsWifiBlocking(wifiConnectShortSec);
             } finally {
                 setRunning(false);
             }
@@ -142,7 +156,7 @@ public class MainActivity extends Activity {
             setRunning(true);
             try {
                 log("Ручное применение настроек. Только Wi-Fi: ExpressLRS RX.");
-                connectOnlyRxWifiBlocking(WIFI_CONNECT_AFTER_REBOOT_SEC);
+                connectOnlyRxWifiBlocking(wifiConnectAfterRebootSec);
                 if (!waitWebUiAvailable(35)) {
                     log("WebUI не отвечает, настройки не применены.");
                     return;
@@ -162,6 +176,11 @@ public class MainActivity extends Activity {
         btnCycle.setText("Цикл");
         btnCycle.setOnClickListener(v -> startCycleMode());
         row2.addView(btnCycle, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1));
+
+        btnSettingsMenu = new Button(this);
+        btnSettingsMenu.setText("Настройки");
+        btnSettingsMenu.setOnClickListener(v -> showSettingsDialog());
+        row2.addView(btnSettingsMenu, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1));
 
         btnStop = new Button(this);
         btnStop.setText("Стоп");
@@ -198,6 +217,144 @@ public class MainActivity extends Activity {
                 LinearLayout.LayoutParams.MATCH_PARENT, 0, 1));
 
         setContentView(root);
+    }
+
+
+    private String currentSettingsText() {
+        return "UID=" + bindingUidText
+                + "; rateidx=" + packetRateIdx
+                + "; wifi-on-interval=" + wifiAutoIntervalSec
+                + "; цикл=" + cycleDelaySec + "с";
+    }
+
+    private void loadAppSettings() {
+        SharedPreferences p = getSharedPreferences("elrs_settings", MODE_PRIVATE);
+        ssidRxHf = p.getString("ssid_rx_hf", DEFAULT_SSID_RX_HF);
+        ssidRx = p.getString("ssid_rx", DEFAULT_SSID_RX);
+        wifiPassword = p.getString("wifi_password", DEFAULT_WIFI_PASSWORD);
+        bindingUidText = p.getString("binding_uid", DEFAULT_BINDING_UID);
+        packetRateIdx = p.getInt("packet_rate_idx", DEFAULT_PACKET_RATE_IDX);
+        wifiAutoIntervalSec = p.getInt("wifi_auto_interval", DEFAULT_WIFI_AUTO_INTERVAL_SEC);
+        cycleDelaySec = p.getInt("cycle_delay", DEFAULT_CYCLE_DELAY_SEC);
+        wifiConnectShortSec = p.getInt("wifi_connect_short", DEFAULT_WIFI_CONNECT_SHORT_SEC);
+        wifiConnectAfterRebootSec = p.getInt("wifi_connect_after", DEFAULT_WIFI_CONNECT_AFTER_REBOOT_SEC);
+    }
+
+    private void saveAppSettings() {
+        getSharedPreferences("elrs_settings", MODE_PRIVATE).edit()
+                .putString("ssid_rx_hf", ssidRxHf)
+                .putString("ssid_rx", ssidRx)
+                .putString("wifi_password", wifiPassword)
+                .putString("binding_uid", bindingUidText)
+                .putInt("packet_rate_idx", packetRateIdx)
+                .putInt("wifi_auto_interval", wifiAutoIntervalSec)
+                .putInt("cycle_delay", cycleDelaySec)
+                .putInt("wifi_connect_short", wifiConnectShortSec)
+                .putInt("wifi_connect_after", wifiConnectAfterRebootSec)
+                .apply();
+    }
+
+    private int parsePositiveInt(String s, int fallback, int min, int max) {
+        try {
+            int v = Integer.parseInt(String.valueOf(s).trim());
+            if (v < min) return min;
+            if (v > max) return max;
+            return v;
+        } catch (Exception e) {
+            return fallback;
+        }
+    }
+
+    private int[] getBindingUidArray() {
+        int[] fallback = new int[] {24, 99, 211, 80, 18, 169};
+        try {
+            String[] parts = bindingUidText.split(",");
+            if (parts.length != 6) return fallback;
+            int[] arr = new int[6];
+            for (int i = 0; i < 6; i++) {
+                int v = Integer.parseInt(parts[i].trim());
+                if (v < 0 || v > 255) return fallback;
+                arr[i] = v;
+            }
+            return arr;
+        } catch (Exception e) {
+            return fallback;
+        }
+    }
+
+    private EditText makeSettingsEdit(LinearLayout parent, String label, String value, int inputType) {
+        TextView tv = new TextView(this);
+        tv.setText(label);
+        tv.setTextSize(13);
+        parent.addView(tv);
+
+        EditText edit = new EditText(this);
+        edit.setSingleLine(true);
+        edit.setText(value);
+        edit.setInputType(inputType);
+        parent.addView(edit, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT));
+        return edit;
+    }
+
+    private void showSettingsDialog() {
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        int pad = dp(14);
+        box.setPadding(pad, pad, pad, pad);
+
+        ScrollView scroll = new ScrollView(this);
+        scroll.addView(box);
+
+        EditText eSsidHf = makeSettingsEdit(box, "SSID до прошивки", ssidRxHf, InputType.TYPE_CLASS_TEXT);
+        EditText eSsidRx = makeSettingsEdit(box, "SSID после ребута / для настроек", ssidRx, InputType.TYPE_CLASS_TEXT);
+        EditText ePass = makeSettingsEdit(box, "Пароль Wi-Fi", wifiPassword, InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD);
+        EditText eUid = makeSettingsEdit(box, "Binding UID, 6 чисел через запятую", bindingUidText, InputType.TYPE_CLASS_TEXT);
+        EditText eRate = makeSettingsEdit(box, "Packet rate index", String.valueOf(packetRateIdx), InputType.TYPE_CLASS_NUMBER);
+        EditText eWifiInterval = makeSettingsEdit(box, "WiFi auto-on interval, секунд", String.valueOf(wifiAutoIntervalSec), InputType.TYPE_CLASS_NUMBER);
+        EditText eCycle = makeSettingsEdit(box, "Пауза нового цикла, секунд", String.valueOf(cycleDelaySec), InputType.TYPE_CLASS_NUMBER);
+        EditText eConnBefore = makeSettingsEdit(box, "Таймаут подключения до прошивки, секунд", String.valueOf(wifiConnectShortSec), InputType.TYPE_CLASS_NUMBER);
+        EditText eConnAfter = makeSettingsEdit(box, "Таймаут подключения после ребута, секунд", String.valueOf(wifiConnectAfterRebootSec), InputType.TYPE_CLASS_NUMBER);
+
+        new AlertDialog.Builder(this)
+                .setTitle("Настройки ELRS Flasher")
+                .setView(scroll)
+                .setPositiveButton("Сохранить", (dialog, which) -> {
+                    ssidRxHf = eSsidHf.getText().toString().trim();
+                    ssidRx = eSsidRx.getText().toString().trim();
+                    wifiPassword = ePass.getText().toString();
+                    bindingUidText = eUid.getText().toString().trim();
+
+                    packetRateIdx = parsePositiveInt(eRate.getText().toString(), DEFAULT_PACKET_RATE_IDX, 0, 200);
+                    wifiAutoIntervalSec = parsePositiveInt(eWifiInterval.getText().toString(), DEFAULT_WIFI_AUTO_INTERVAL_SEC, 0, 3600);
+                    cycleDelaySec = parsePositiveInt(eCycle.getText().toString(), DEFAULT_CYCLE_DELAY_SEC, 1, 3600);
+                    wifiConnectShortSec = parsePositiveInt(eConnBefore.getText().toString(), DEFAULT_WIFI_CONNECT_SHORT_SEC, 3, 120);
+                    wifiConnectAfterRebootSec = parsePositiveInt(eConnAfter.getText().toString(), DEFAULT_WIFI_CONNECT_AFTER_REBOOT_SEC, 3, 180);
+
+                    if (ssidRxHf.length() == 0) ssidRxHf = DEFAULT_SSID_RX_HF;
+                    if (ssidRx.length() == 0) ssidRx = DEFAULT_SSID_RX;
+                    if (wifiPassword.length() == 0) wifiPassword = DEFAULT_WIFI_PASSWORD;
+
+                    saveAppSettings();
+                    log("Настройки сохранены: " + currentSettingsText());
+                    log("Wi-Fi: " + ssidRxHf + " / " + ssidRx + ", пароль " + wifiPassword);
+                })
+                .setNeutralButton("Сброс", (dialog, which) -> {
+                    ssidRxHf = DEFAULT_SSID_RX_HF;
+                    ssidRx = DEFAULT_SSID_RX;
+                    wifiPassword = DEFAULT_WIFI_PASSWORD;
+                    bindingUidText = DEFAULT_BINDING_UID;
+                    packetRateIdx = DEFAULT_PACKET_RATE_IDX;
+                    wifiAutoIntervalSec = DEFAULT_WIFI_AUTO_INTERVAL_SEC;
+                    cycleDelaySec = DEFAULT_CYCLE_DELAY_SEC;
+                    wifiConnectShortSec = DEFAULT_WIFI_CONNECT_SHORT_SEC;
+                    wifiConnectAfterRebootSec = DEFAULT_WIFI_CONNECT_AFTER_REBOOT_SEC;
+                    saveAppSettings();
+                    log("Настройки сброшены: " + currentSettingsText());
+                })
+                .setNegativeButton("Отмена", null)
+                .show();
     }
 
     private void requestRuntimePermissions() {
@@ -344,9 +501,9 @@ public class MainActivity extends Activity {
 
                     logBig("ЭТАП ПРОШИВКИ И POST-FLASH НАСТРОЙКИ ЗАВЕРШЕНЫ.");
 
-                    for (int left = CYCLE_DELAY_SEC; left > 0; left--) {
+                    for (int left = cycleDelaySec; left > 0; left--) {
                         if (!cycleMode || !running) break;
-                        if (left == CYCLE_DELAY_SEC || left <= 5 || left % 10 == 0) {
+                        if (left == cycleDelaySec || left <= 5 || left % 10 == 0) {
                             log("Следующий цикл через " + left + " сек...");
                         }
                         sleep(1000);
@@ -363,7 +520,7 @@ public class MainActivity extends Activity {
 
     private boolean runFullFlashCycle() {
         try {
-            if (!connectToAnyElrsWifiBlocking(WIFI_CONNECT_SHORT_SEC)) {
+            if (!connectToAnyElrsWifiBlocking(wifiConnectShortSec)) {
                 log("Не удалось подключиться к ExpressLRS Wi-Fi.");
                 return false;
             }
@@ -382,7 +539,7 @@ public class MainActivity extends Activity {
             waitWebUiDown(60);
 
             log("После ребута снова подключаюсь к Wi-Fi. Приоритет: ExpressLRS RX.");
-            if (!connectAfterRebootWifiBlocking(WIFI_CONNECT_AFTER_REBOOT_SEC)) {
+            if (!connectAfterRebootWifiBlocking(wifiConnectAfterRebootSec)) {
                 log("Не удалось повторно подключиться после ребута.");
                 return false;
             }
@@ -395,7 +552,7 @@ public class MainActivity extends Activity {
             boolean okSettings = applySettings();
             if (!okSettings) {
                 log("Post настройки не применились. Делаю автоповтор один раз с приоритетом ExpressLRS RX...");
-                connectAfterRebootWifiBlocking(WIFI_CONNECT_AFTER_REBOOT_SEC);
+                connectAfterRebootWifiBlocking(wifiConnectAfterRebootSec);
                 waitWebUiAvailable(35);
                 okSettings = applySettings();
             }
@@ -444,31 +601,31 @@ public class MainActivity extends Activity {
     }
 
     private boolean connectOnlyRxHfWifiBlocking(int timeoutSec) {
-        log("Запрашиваю подключение к Wi-Fi ExpressLRS. Только: " + SSID_RX_HF);
+        log("Запрашиваю подключение к Wi-Fi ExpressLRS. Только: " + ssidRxHf);
         if (isWebUiReachableNow()) {
             log("WebUI уже доступен через текущую Wi-Fi сеть.");
             return true;
         }
-        boolean ok = connectWifiBlocking(SSID_RX_HF, timeoutSec);
+        boolean ok = connectWifiBlocking(ssidRxHf, timeoutSec);
         if (!ok && isWebUiReachableNow()) return true;
         return ok;
     }
 
     private boolean connectOnlyRxWifiBlocking(int timeoutSec) {
-        log("Запрашиваю подключение к Wi-Fi ExpressLRS. Только: " + SSID_RX);
+        log("Запрашиваю подключение к Wi-Fi ExpressLRS. Только: " + ssidRx);
         releaseCurrentWifiRequest();
         sleep(500);
-        boolean ok = connectWifiBlocking(SSID_RX, timeoutSec);
+        boolean ok = connectWifiBlocking(ssidRx, timeoutSec);
         if (!ok && isWebUiReachableNow()) return true;
         return ok;
     }
 
     private boolean connectToAnyElrsWifiBlocking(int timeoutSec) {
-        return connectOnlyRxHfWifiBlocking(Math.min(timeoutSec, WIFI_CONNECT_SHORT_SEC));
+        return connectOnlyRxHfWifiBlocking(Math.min(timeoutSec, wifiConnectShortSec));
     }
 
     private boolean connectAfterRebootWifiBlocking(int timeoutSec) {
-        return connectOnlyRxWifiBlocking(Math.min(timeoutSec, WIFI_CONNECT_AFTER_REBOOT_SEC));
+        return connectOnlyRxWifiBlocking(Math.min(timeoutSec, wifiConnectAfterRebootSec));
     }
 
     private boolean connectPreferredElrsWifiBlocking(String primarySsid, String fallbackSsid, int timeoutSec, boolean acceptAlreadyConnected) {
@@ -540,7 +697,7 @@ public class MainActivity extends Activity {
 
             WifiNetworkSpecifier specifier = new WifiNetworkSpecifier.Builder()
                     .setSsid(ssid)
-                    .setWpa2Passphrase(WIFI_PASSWORD)
+                    .setWpa2Passphrase(wifiPassword)
                     .build();
 
             NetworkRequest request = new NetworkRequest.Builder()
@@ -629,6 +786,16 @@ public class MainActivity extends Activity {
         }
         log("WebUI не пропал за таймаут. Продолжаю.");
         return false;
+    }
+
+    private String extractJsonStatus(String body) {
+        if (body == null || body.length() == 0) return "";
+        try {
+            JSONObject obj = new JSONObject(body);
+            return obj.optString("status", "").trim().toLowerCase(Locale.ROOT);
+        } catch (Exception ignored) {
+            return "";
+        }
     }
 
     private boolean uploadFirmware() {
@@ -888,7 +1055,7 @@ public class MainActivity extends Activity {
             if (cfg == null) cfg = root;
 
             JSONArray uid = new JSONArray();
-            for (int b : BINDING_UID_TEST) uid.put(b);
+            for (int b : getBindingUidArray()) uid.put(b);
 
             cfg.put("uid", uid);
             cfg.put("vbind", cfg.optInt("vbind", 0));
@@ -912,8 +1079,8 @@ public class MainActivity extends Activity {
             }
 
             JSONObject options = new JSONObject(optRes.body);
-            options.put("rateidx", PACKET_RATE_IDX);
-            options.put("wifi-on-interval", WIFI_AUTO_INTERVAL_SEC);
+            options.put("rateidx", packetRateIdx);
+            options.put("wifi-on-interval", wifiAutoIntervalSec);
             options.put("customised", true);
 
             HttpResult optPost = httpPostJson("/options.json", options.toString());
@@ -1037,7 +1204,7 @@ public class MainActivity extends Activity {
             if (cfg == null) cfg = root;
 
             JSONArray uid = new JSONArray();
-            for (int b : BINDING_UID_TEST) uid.put(b);
+            for (int b : getBindingUidArray()) uid.put(b);
             cfg.put("uid", uid);
             cfg.put("vbind", cfg.optInt("vbind", 0));
             cfg.put("force-tlm", 1);
@@ -1060,8 +1227,8 @@ public class MainActivity extends Activity {
             }
 
             JSONObject options = new JSONObject(optRes.body);
-            options.put("rateidx", PACKET_RATE_IDX);
-            options.put("wifi-on-interval", WIFI_AUTO_INTERVAL_SEC);
+            options.put("rateidx", packetRateIdx);
+            options.put("wifi-on-interval", wifiAutoIntervalSec);
             options.put("customised", true);
 
             HttpResult optPost = httpPostJson("/options.json", options.toString());
@@ -1248,6 +1415,7 @@ public class MainActivity extends Activity {
             btnFlash.setEnabled(!value);
             btnSettings.setEnabled(!value);
             btnCycle.setEnabled(!value);
+            btnSettingsMenu.setEnabled(!value);
             btnStop.setEnabled(value);
             statusView.setText(value ? "Работает..." : "Готово");
         });
